@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AeroMist — AI-Assisted Predictive Weather Routing</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; background: #070b14; }
+    #root { min-height: 100vh; }
+
+    .stat-card-anim { animation: fadeSlideIn 0.6s ease forwards; opacity: 0; }
+    @keyframes fadeSlideIn {
+      from { opacity: 0; transform: translateY(12px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    .scan-line {
+      position: fixed; top: 0; left: 0; right: 0; height: 2px;
+      background: rgba(0,245,255,0.08);
+      animation: scanMove 6s linear infinite;
+      pointer-events: none; z-index: 999;
+    }
+    @keyframes scanMove { from { top: -2px; } to { top: 100vh; } }
+    .zone-hover:hover { cursor: pointer; opacity: 1 !important; }
+    .toggle-btn:hover { background: rgba(0,245,255,0.15) !important; }
+    ::-webkit-scrollbar { width: 4px; background: #0a0f1c; }
+    ::-webkit-scrollbar-thumb { background: #1a3050; }
+    .grid-bg {
+      position: fixed; inset: 0; pointer-events: none;
+      background-image:
+        linear-gradient(rgba(0,245,255,0.025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0,245,255,0.025) 1px, transparent 1px);
+      background-size: 40px 40px;
+    }
+    .vignette {
+      position: fixed; inset: 0; pointer-events: none;
+      background: radial-gradient(ellipse at center, transparent 40%, rgba(2,5,12,0.85) 100%);
+    }
+    .blink { animation: blink 1.4s step-start infinite; }
+    @keyframes blink { 50% { opacity: 0; } }
+    .neon-text-cyan {
+      color: #00f5ff;
+      text-shadow: 0 0 10px rgba(0,245,255,0.6), 0 0 20px rgba(0,245,255,0.3);
+    }
+    @keyframes zoneBreath {
+      0%,100% { opacity: 0.55; }
+      50%      { opacity: 0.85; }
+    }
+    .zone-breath { animation: zoneBreath 3s ease-in-out infinite; }
+    @keyframes dashAnim { to { stroke-dashoffset: -100; } }
+    .dash-anim { animation: dashAnim 3s linear infinite; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─── CONSTANTS ─────────────────────────────────────────────────────────
+    const FLIGHT_ZONES = [
+      { id:1, x:275, y:115, rx:52, ry:28, label:"ISSR-α", risk:"CRITICAL", temp:"-58°C", rhi:"118%", alt:"FL380" },
+      { id:2, x:390, y:95,  rx:38, ry:22, label:"ISSR-β", risk:"HIGH",     temp:"-54°C", rhi:"109%", alt:"FL370" },
+      { id:3, x:495, y:108, rx:44, ry:24, label:"ISSR-γ", risk:"MODERATE", temp:"-51°C", rhi:"104%", alt:"FL360" },
+    ];
+    const WAYPOINTS = [
+      { x:95,  y:148, label:"LHR",  full:"London Heathrow" },
+      { x:195, y:132, label:"WAY1", full:"N51° W010°" },
+      { x:310, y:108, label:"NATX", full:"NAT Track X" },
+      { x:435, y:98,  label:"NATY", full:"NAT Track Y" },
+      { x:555, y:115, label:"WAY2", full:"N47° W050°" },
+      { x:660, y:140, label:"JFK",  full:"New York JFK" },
+    ];
+    const OPT_WAYPOINTS = [
+      { x:95,  y:148 }, { x:195, y:155 }, { x:310, y:148 },
+      { x:435, y:140 }, { x:555, y:148 }, { x:660, y:140 },
+    ];
+
+    function smoothPath(pts) {
+      if (pts.length < 2) return "";
+      let d = `M ${pts[0].x} ${pts[0].y}`;
+      for (let i = 1; i < pts.length; i++) {
+        const prev = pts[i-1], curr = pts[i], mx = (prev.x + curr.x) / 2;
+        d += ` C ${mx} ${prev.y}, ${mx} ${curr.y}, ${curr.x} ${curr.y}`;
+      }
+      return d;
+    }
+
+    // ─── ANIMATED COUNTER ──────────────────────────────────────────────────
+    function AnimCounter({ target, decimals=0, duration=1800, prefix="", suffix="" }) {
+      const [val, setVal] = useState(0);
+      useEffect(() => {
+        let start = null;
+        const step = ts => {
+          if (!start) start = ts;
+          const prog = Math.min((ts - start) / duration, 1);
+          const ease = 1 - Math.pow(1 - prog, 3);
+          setVal(+(target * ease).toFixed(decimals));
+          if (prog < 1) requestAnimationFrame(step);
+        };
+        const raf = requestAnimationFrame(step);
+        return () => cancelAnimationFrame(raf);
+      }, [target]);
+      return <span>{prefix}{val.toFixed(decimals)}{suffix}</span>;
+    }
+
+    // ─── AIRCRAFT MARKER ───────────────────────────────────────────────────
+    function AircraftMarker({ x, y }) {
+      return (
+        <g transform={`translate(${x},${y})`} style={{ filter:"drop-shadow(0 0 8px #00f5ff)" }}>
+          <text x="0" y="6" textAnchor="middle" fontSize="18" fill="#00f5ff">✈</text>
+          <circle cx="0" cy="0" r="22" fill="none" stroke="#00f5ff" strokeWidth="1" opacity="0.3">
+            <animate attributeName="r" values="22;32;22" dur="1.8s" repeatCount="indefinite"/>
+            <animate attributeName="opacity" values="0.3;0;0.3" dur="1.8s" repeatCount="indefinite"/>
+          </circle>
+        </g>
+      );
+    }
+
+    // ─── STAT CARD ─────────────────────────────────────────────────────────
+    function StatCard({ icon, label, value, sub, accent, trend, delay=0 }) {
+      const colors = {
+        cyan:   { border:"#00f5ff", glow:"rgba(0,245,255,0.15)",   text:"#00f5ff", bg:"rgba(0,245,255,0.05)" },
+        orange: { border:"#ff6b35", glow:"rgba(255,107,53,0.15)",  text:"#ff6b35", bg:"rgba(255,107,53,0.05)" },
+        green:  { border:"#39ff14", glow:"rgba(57,255,20,0.15)",   text:"#39ff14", bg:"rgba(57,255,20,0.05)" },
+      };
+      const c = colors[accent] || colors.cyan;
+      return (
+        <div className="stat-card-anim" style={{
+          border:`1px solid ${c.border}`,
+          background:`linear-gradient(135deg, ${c.bg}, rgba(10,15,28,0.9))`,
+          boxShadow:`0 0 24px ${c.glow}, inset 0 1px 0 rgba(255,255,255,0.05)`,
+          borderRadius:"2px", padding:"24px 20px", position:"relative",
+          overflow:"hidden", animationDelay:`${delay}ms`,
+        }}>
+          <div style={{ position:"absolute",top:0,left:0,width:12,height:12,borderTop:`2px solid ${c.border}`,borderLeft:`2px solid ${c.border}` }}/>
+          <div style={{ position:"absolute",bottom:0,right:0,width:12,height:12,borderBottom:`2px solid ${c.border}`,borderRight:`2px solid ${c.border}` }}/>
+          <div style={{ position:"absolute",inset:0,background:"repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(255,255,255,0.01) 2px,rgba(255,255,255,0.01) 4px)",pointerEvents:"none" }}/>
+          <div style={{ display:"flex",alignItems:"center",gap:10,marginBottom:12 }}>
+            <span style={{ fontSize:22 }}>{icon}</span>
+            <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.65rem",letterSpacing:"0.15em",color:"#4a7fa5",textTransform:"uppercase" }}>{label}</span>
+            {trend && <span style={{ marginLeft:"auto",fontSize:"0.7rem",color:trend>0?"#39ff14":"#ff6b35" }}>{trend>0?"▲":"▼"} {Math.abs(trend)}%</span>}
+          </div>
+          <div style={{ fontFamily:"'Orbitron',sans-serif",fontSize:"1.8rem",fontWeight:700,color:c.text,letterSpacing:"-0.02em",lineHeight:1 }}>{value}</div>
+          {sub && <div style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.65rem",color:"#4a7fa5",marginTop:8 }}>{sub}</div>}
+        </div>
+      );
+    }
+
+    // ─── RISK BADGE ────────────────────────────────────────────────────────
+    function RiskBadge({ level }) {
+      const map = {
+        CRITICAL: { bg:"rgba(255,0,60,0.15)",   border:"#ff003c", text:"#ff4466" },
+        HIGH:     { bg:"rgba(255,107,53,0.15)", border:"#ff6b35", text:"#ff8c5a" },
+        MODERATE: { bg:"rgba(255,200,0,0.12)",  border:"#ffc800", text:"#ffd633" },
+      };
+      const s = map[level] || map.MODERATE;
+      return (
+        <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.55rem",letterSpacing:"0.1em",background:s.bg,border:`1px solid ${s.border}`,color:s.text,padding:"2px 8px",borderRadius:"2px" }}>
+          {level}
+        </span>
+      );
+    }
+
+    // ─── RADIAL GAUGE ──────────────────────────────────────────────────────
+    function RadialGauge({ value, max, label, color }) {
+      const r=44, cx=56, cy=56, circ=2*Math.PI*r;
+      const arc=(value/max)*circ*0.75;
+      return (
+        <div style={{ display:"flex",flexDirection:"column",alignItems:"center" }}>
+          <svg width="112" height="90" viewBox="0 0 112 90">
+            <circle cx={cx} cy={cy} r={r} fill="none" stroke="rgba(255,255,255,0.06)" strokeWidth="8"
+              strokeDasharray={`${circ*0.75} ${circ*0.25}`} strokeLinecap="round"
+              transform={`rotate(135 ${cx} ${cy})`}/>
+            <circle cx={cx} cy={cy} r={r} fill="none" stroke={color} strokeWidth="8"
+              strokeDasharray={`${arc} ${circ-arc}`} strokeDashoffset={`${-(circ*0.25)}`}
+              strokeLinecap="round" transform={`rotate(135 ${cx} ${cy})`}
+              style={{ filter:`drop-shadow(0 0 6px ${color})`,transition:"stroke-dasharray 1.2s cubic-bezier(0.4,0,0.2,1)" }}>
+              <animate attributeName="stroke-dasharray" from={`0 ${circ}`} to={`${arc} ${circ-arc}`} dur="1.5s" fill="freeze"/>
+            </circle>
+            <text x={cx} y={cy-2} textAnchor="middle" fontFamily="'Orbitron',sans-serif" fontSize="15" fontWeight="700" fill={color}>{value}</text>
+            <text x={cx} y={cy+14} textAnchor="middle" fontFamily="'Share Tech Mono',monospace" fontSize="8" fill="#4a7fa5">/{max}</text>
+          </svg>
+          <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.6rem",color:"#4a7fa5",textTransform:"uppercase",letterSpacing:"0.1em",marginTop:-8 }}>{label}</span>
+        </div>
+      );
+    }
+
+    // ─── FLIGHT LEVEL COMPARISON ───────────────────────────────────────────
+    function FlightLevelComparison({ current, optimized }) {
+      const pct = v => ((v - 320) / (420 - 320)) * 100;
+      return (
+        <div style={{ padding:"16px 0" }}>
+          {[{ label:"CURRENT ROUTE", val:current, color:"#ff6b35", note:"Contrail risk: HIGH" },
+            { label:"AI OPTIMIZED",  val:optimized, color:"#00f5ff", note:"Contrail risk: LOW" }].map((item,i) => (
+            <div key={i} style={{ marginBottom:i===0?16:0 }}>
+              <div style={{ display:"flex",justifyContent:"space-between",marginBottom:6 }}>
+                <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.6rem",color:"#4a7fa5",letterSpacing:"0.1em" }}>{item.label}</span>
+                <span style={{ fontFamily:"'Orbitron',sans-serif",fontSize:"0.75rem",fontWeight:700,color:item.color }}>FL{item.val}</span>
+              </div>
+              <div style={{ height:8,background:"rgba(255,255,255,0.05)",borderRadius:1,position:"relative",overflow:"hidden" }}>
+                <div style={{ height:"100%",width:`${pct(item.val)}%`,background:`linear-gradient(90deg,transparent,${item.color})`,boxShadow:`0 0 10px ${item.color}`,transition:"width 1.2s cubic-bezier(0.4,0,0.2,1)" }}/>
+              </div>
+              <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.55rem",color:item.color==="#ff6b35"?"#ff8c5a":"#00c8d4",marginTop:4,display:"block" }}>{item.note}</span>
+            </div>
+          ))}
+          <div style={{ marginTop:14,padding:"8px 12px",background:"rgba(0,245,255,0.05)",border:"1px solid rgba(0,245,255,0.15)",borderRadius:"1px" }}>
+            <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.6rem",color:"#00f5ff" }}>
+              ↓ {current-optimized},000 ft adjustment · SAC threshold avoided
+            </span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─── MAIN APP ──────────────────────────────────────────────────────────
+    function AeroMist() {
+      const [activeZone, setActiveZone] = useState(null);
+      const [aircraftPos, setAircraftPos] = useState(0);
+      const [showOptRoute, setShowOptRoute] = useState(false);
+      const [time, setTime] = useState(new Date());
+      const animRef = useRef(null);
+
+      useEffect(() => {
+        const t = setInterval(() => setTime(new Date()), 1000);
+        return () => clearInterval(t);
+      }, []);
+
+      useEffect(() => {
+        let pos = 0;
+        const animate = () => {
+          pos = (pos + 0.0008) % 1;
+          setAircraftPos(pos);
+          animRef.current = requestAnimationFrame(animate);
+        };
+        animRef.current = requestAnimationFrame(animate);
+        return () => cancelAnimationFrame(animRef.current);
+      }, []);
+
+      const getAircraftXY = () => {
+        const pts = WAYPOINTS, total = pts.length - 1;
+        const seg = aircraftPos * total, idx = Math.floor(seg), t2 = seg - idx;
+        if (idx >= total) return pts[total];
+        const a = pts[idx], b = pts[idx+1];
+        return { x: a.x + (b.x-a.x)*t2, y: a.y + (b.y-a.y)*t2 };
+      };
+
+      const ac = getAircraftXY();
+      const fmtTime = d => d.toLocaleTimeString("en-GB",{ hour12:false,timeZone:"UTC",hour:"2-digit",minute:"2-digit",second:"2-digit" });
+
+      return (
+        <div style={{ minHeight:"100vh",background:"#070b14",fontFamily:"'Share Tech Mono',monospace",color:"#c8d8e8",position:"relative",overflow:"hidden" }}>
+          <div className="grid-bg"/>
+          <div className="vignette"/>
+          <div className="scan-line"/>
+
+          {/* TOPBAR */}
+          <header style={{ borderBottom:"1px solid rgba(0,245,255,0.12)",background:"rgba(7,11,20,0.95)",backdropFilter:"blur(12px)",padding:"0 32px",height:60,display:"flex",alignItems:"center",justifyContent:"space-between",position:"sticky",top:0,zIndex:100,boxShadow:"0 0 30px rgba(0,245,255,0.05)" }}>
+            <div style={{ display:"flex",alignItems:"center",gap:16 }}>
+              <div style={{ width:36,height:36,background:"linear-gradient(135deg,#00f5ff20,#00f5ff10)",border:"1px solid rgba(0,245,255,0.4)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:16 }}>✈</div>
+              <div>
+                <div className="neon-text-cyan" style={{ fontFamily:"'Orbitron',sans-serif",fontWeight:700,fontSize:"0.95rem",letterSpacing:"0.15em" }}>AEROMIST</div>
+                <div style={{ fontSize:"0.55rem",letterSpacing:"0.2em",color:"#2a5070",textTransform:"uppercase" }}>AI-Assisted Predictive Weather Routing</div>
+              </div>
+            </div>
+            <div style={{ display:"flex",gap:32,alignItems:"center" }}>
+              {[{label:"FLIGHT",val:"BA0293"},{label:"ROUTE",val:"LHR → JFK"},{label:"STATUS",val:"EN ROUTE",blink:true}].map(item => (
+                <div key={item.label} style={{ textAlign:"center" }}>
+                  <div style={{ fontSize:"0.5rem",letterSpacing:"0.15em",color:"#2a5070",textTransform:"uppercase" }}>{item.label}</div>
+                  <div style={{ fontFamily:"'Orbitron',sans-serif",fontSize:"0.75rem",fontWeight:600,color:item.blink?"#39ff14":"#00f5ff" }}>
+                    {item.val}{item.blink && <span className="blink" style={{ marginLeft:6,fontSize:"0.5rem" }}>●</span>}
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div style={{ textAlign:"right" }}>
+              <div style={{ fontFamily:"'Orbitron',sans-serif",fontSize:"1.1rem",fontWeight:700,color:"#00f5ff",letterSpacing:"0.08em" }}>{fmtTime(time)}Z</div>
+              <div style={{ fontSize:"0.55rem",color:"#2a5070",letterSpacing:"0.1em" }}>{time.toLocaleDateString("en-GB",{day:"2-digit",month:"short",year:"numeric"}).toUpperCase()} UTC</div>
+            </div>
+          </header>
+
+          {/* MAIN GRID */}
+          <div style={{ display:"grid",gridTemplateColumns:"1fr 320px",gap:1,background:"rgba(0,245,255,0.06)",minHeight:"calc(100vh - 60px)" }}>
+
+            {/* LEFT COLUMN */}
+            <div style={{ background:"#070b14",display:"flex",flexDirection:"column",gap:1 }}>
+
+              {/* MAP PANEL */}
+              <div style={{ background:"linear-gradient(180deg,#060a14 0%,#080e1c 100%)",padding:"24px 28px",borderBottom:"1px solid rgba(0,245,255,0.06)",position:"relative" }}>
+                <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16 }}>
+                  <div>
+                    <span style={{ fontSize:"0.55rem",letterSpacing:"0.2em",color:"#2a5070",textTransform:"uppercase" }}>◈ LIVE ROUTE ANALYSIS</span>
+                    <div style={{ fontFamily:"'Orbitron',sans-serif",fontSize:"0.8rem",fontWeight:600,color:"#8aabcc",marginTop:2 }}>North Atlantic Track — Real-Time ISSR Detection</div>
+                  </div>
+                  <button className="toggle-btn" onClick={() => setShowOptRoute(v => !v)} style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.6rem",letterSpacing:"0.1em",textTransform:"uppercase",background:showOptRoute?"rgba(0,245,255,0.1)":"rgba(255,107,53,0.1)",border:`1px solid ${showOptRoute?"rgba(0,245,255,0.4)":"rgba(255,107,53,0.4)"}`,color:showOptRoute?"#00f5ff":"#ff6b35",padding:"7px 16px",cursor:"pointer",transition:"all 0.3s" }}>
+                    {showOptRoute ? "◉ OPT ROUTE ACTIVE" : "○ SHOW AI ROUTE"}
+                  </button>
+                </div>
+
+                <svg viewBox="0 0 760 220" style={{ width:"100%",height:"auto",display:"block" }} role="img" aria-label="North Atlantic flight route map">
+                  <defs>
+                    <radialGradient id="oceanGrad" cx="50%" cy="50%" r="60%">
+                      <stop offset="0%" stopColor="#0a1628"/>
+                      <stop offset="100%" stopColor="#050a14"/>
+                    </radialGradient>
+                    <radialGradient id="zoneGradR" cx="50%" cy="50%" r="50%">
+                      <stop offset="0%" stopColor="#ff003c" stopOpacity="0.45"/>
+                      <stop offset="100%" stopColor="#ff003c" stopOpacity="0"/>
+                    </radialGradient>
+                    <radialGradient id="zoneGradO" cx="50%" cy="50%" r="50%">
+                      <stop offset="0%" stopColor="#ff6b35" stopOpacity="0.4"/>
+                      <stop offset="100%" stopColor="#ff6b35" stopOpacity="0"/>
+                    </radialGradient>
+                    <radialGradient id="zoneGradY" cx="50%" cy="50%" r="50%">
+                      <stop offset="0%" stopColor="#ffc800" stopOpacity="0.35"/>
+                      <stop offset="100%" stopColor="#ffc800" stopOpacity="0"/>
+                    </radialGradient>
+                    <marker id="arrowCyan" markerWidth="6" markerHeight="6" refX="3" refY="3" orient="auto">
+                      <path d="M0,0 L6,3 L0,6 Z" fill="#00f5ff" opacity="0.7"/>
+                    </marker>
+                  </defs>
+                  <rect width="760" height="220" fill="url(#oceanGrad)"/>
+                  {[40,80,120,160,200,240,280,320,360,400,440,480,520,560,600,640,680,720].map(x => (
+                    <line key={x} x1={x} y1={0} x2={x} y2={220} stroke="rgba(0,245,255,0.03)" strokeWidth="1"/>
+                  ))}
+                  {[40,80,120,160,200].map(y => (
+                    <line key={y} x1={0} y1={y} x2={760} y2={y} stroke="rgba(0,245,255,0.03)" strokeWidth="1"/>
+                  ))}
+                  <path d="M 50,40 Q 90,20 110,50 Q 130,70 100,100 Q 70,120 50,100 Z" fill="rgba(0,245,255,0.04)" stroke="rgba(0,245,255,0.06)" strokeWidth="0.5"/>
+                  <path d="M 75,55 Q 95,45 100,75 Q 85,95 70,80 Z" fill="rgba(0,245,255,0.06)" stroke="rgba(0,245,255,0.1)" strokeWidth="0.5"/>
+                  <path d="M 630,30 Q 700,25 740,60 Q 760,100 740,150 Q 700,180 650,160 Q 620,140 630,100 Q 640,60 630,30 Z" fill="rgba(0,245,255,0.04)" stroke="rgba(0,245,255,0.06)" strokeWidth="0.5"/>
+
+                  {FLIGHT_ZONES.map(zone => {
+                    const gradId = zone.risk==="CRITICAL"?"zoneGradR":zone.risk==="HIGH"?"zoneGradO":"zoneGradY";
+                    const strokeC = zone.risk==="CRITICAL"?"#ff003c":zone.risk==="HIGH"?"#ff6b35":"#ffc800";
+                    return (
+                      <g key={zone.id} className="zone-hover zone-breath" style={{ opacity:activeZone?.id===zone.id?1:0.75 }} onClick={() => setActiveZone(activeZone?.id===zone.id?null:zone)}>
+                        <ellipse cx={zone.x} cy={zone.y} rx={zone.rx*1.8} ry={zone.ry*1.8} fill={`url(#${gradId})`}/>
+                        <ellipse cx={zone.x} cy={zone.y} rx={zone.rx} ry={zone.ry} fill={strokeC} fillOpacity="0.12" stroke={strokeC} strokeWidth="1.5" strokeDasharray="4 3" style={{ filter:`drop-shadow(0 0 8px ${strokeC})` }}/>
+                        <text x={zone.x} y={zone.y-zone.ry-5} textAnchor="middle" fontFamily="'Share Tech Mono',monospace" fontSize="8" fill={strokeC} letterSpacing="1">{zone.label}</text>
+                        <text x={zone.x} y={zone.y+zone.ry+12} textAnchor="middle" fontFamily="'Share Tech Mono',monospace" fontSize="7" fill={strokeC} opacity="0.7">{zone.risk}</text>
+                      </g>
+                    );
+                  })}
+
+                  <path d={smoothPath(WAYPOINTS)} fill="none" stroke="#ff6b35" strokeWidth="2" strokeDasharray="8 5" opacity="0.7" style={{ filter:"drop-shadow(0 0 6px #ff6b35)" }} className="dash-anim"/>
+
+                  {showOptRoute && (
+                    <>
+                      <path d={smoothPath(OPT_WAYPOINTS)} fill="none" stroke="#00f5ff" strokeWidth="2.5" opacity="0.9" style={{ filter:"drop-shadow(0 0 8px #00f5ff)" }} markerEnd="url(#arrowCyan)"/>
+                      <path d={smoothPath(OPT_WAYPOINTS)} fill="none" stroke="#00f5ff" strokeWidth="6" opacity="0.06"/>
+                    </>
+                  )}
+
+                  {WAYPOINTS.map((wp,i) => (
+                    <g key={i}>
+                      <circle cx={wp.x} cy={wp.y} r="4" fill="#0a1628" stroke="#00f5ff" strokeWidth="1.5" style={{ filter:"drop-shadow(0 0 4px #00f5ff)" }}/>
+                      <text x={wp.x} y={wp.y-9} textAnchor="middle" fontFamily="'Share Tech Mono',monospace" fontSize="8" fill="#4a7fa5" letterSpacing="0.5">{wp.label}</text>
+                    </g>
+                  ))}
+                  {[WAYPOINTS[0], WAYPOINTS[WAYPOINTS.length-1]].map((ap,i) => (
+                    <g key={i}>
+                      <circle cx={ap.x} cy={ap.y} r="8" fill="rgba(0,245,255,0.08)" stroke="#00f5ff" strokeWidth="1.5"/>
+                      <circle cx={ap.x} cy={ap.y} r="3" fill="#00f5ff"/>
+                      <text x={ap.x} y={ap.y+22} textAnchor="middle" fontFamily="'Orbitron',sans-serif" fontSize="9" fontWeight="700" fill="#00f5ff">{ap.label}</text>
+                    </g>
+                  ))}
+
+                  <AircraftMarker x={ac.x} y={ac.y}/>
+
+                  {activeZone && (
+                    <g>
+                      <rect x={activeZone.x+activeZone.rx+8} y={activeZone.y-36} width="110" height="70" rx="1" fill="#070b14" stroke="rgba(0,245,255,0.3)" strokeWidth="1" opacity="0.95"/>
+                      {[`ALT: ${activeZone.alt}`,`TEMP: ${activeZone.temp}`,`RHi: ${activeZone.rhi}`,`TYPE: ${activeZone.risk}`].map((line,j) => (
+                        <text key={j} x={activeZone.x+activeZone.rx+16} y={activeZone.y-22+j*14} fontFamily="'Share Tech Mono',monospace" fontSize="7.5"
+                          fill={j===3?(activeZone.risk==="CRITICAL"?"#ff4466":activeZone.risk==="HIGH"?"#ff8c5a":"#ffd633"):"#8aabcc"}>{line}</text>
+                      ))}
+                    </g>
+                  )}
+
+                  <g>
+                    {[{c:"#ff6b35",l:"Original Route"},{c:"#00f5ff",l:"AI Optimized"},{c:"#ff003c",l:"Critical ISSR"}].map((item,i) => (
+                      <g key={i} transform={`translate(12,${190+i*10})`}>
+                        <rect x="0" y="-5" width="14" height="3" fill={item.c} opacity="0.8" rx="1"/>
+                        <text x="18" y="0" fontFamily="'Share Tech Mono',monospace" fontSize="7" fill="#4a7fa5">{item.l}</text>
+                      </g>
+                    ))}
+                  </g>
+                </svg>
+
+                <div style={{ display:"flex",gap:8,marginTop:12 }}>
+                  {FLIGHT_ZONES.map(zone => {
+                    const strokeC = zone.risk==="CRITICAL"?"#ff003c":zone.risk==="HIGH"?"#ff6b35":"#ffc800";
+                    return (
+                      <div key={zone.id} onClick={() => setActiveZone(activeZone?.id===zone.id?null:zone)}
+                        style={{ flex:1,padding:"8px 12px",background:activeZone?.id===zone.id?`rgba(${zone.risk==="CRITICAL"?"255,0,60":zone.risk==="HIGH"?"255,107,53":"255,200,0"},0.1)`:"rgba(255,255,255,0.02)",border:`1px solid ${activeZone?.id===zone.id?strokeC:"rgba(255,255,255,0.06)"}`,cursor:"pointer",transition:"all 0.2s" }}>
+                        <div style={{ fontSize:"0.55rem",color:"#2a5070",marginBottom:3 }}>{zone.label} · {zone.alt}</div>
+                        <RiskBadge level={zone.risk}/>
+                        <div style={{ fontSize:"0.55rem",color:"#4a7fa5",marginTop:4 }}>RHi {zone.rhi} · {zone.temp}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* STAT CARDS */}
+              <div style={{ display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:1,background:"rgba(0,245,255,0.04)",borderBottom:"1px solid rgba(0,245,255,0.06)" }}>
+                {[
+                  { icon:"🌡",label:"Radiative Forcing Avoided",accent:"green",
+                    value:<><AnimCounter target={1.2} decimals={1} duration={1600}/><span style={{fontSize:"0.8rem"}}> t CO₂e</span></>,
+                    sub:"vs. standard routing · per flight",trend:88 },
+                  { icon:"⛽",label:"Fuel Penalty (AI Route)",accent:"orange",
+                    value:<><span style={{fontSize:"1.1rem"}}>+</span><AnimCounter target={0.4} decimals={1} duration={1400}/><span style={{fontSize:"0.8rem"}}>%</span></>,
+                    sub:"≈ 42 kg additional fuel · within ops limits",trend:-0.4 },
+                  { icon:"📈",label:"Net Climate Benefit",accent:"cyan",
+                    value:<><span style={{fontSize:"1.1rem"}}>+</span><AnimCounter target={88} duration={1800}/><span style={{fontSize:"0.8rem"}}>%</span></>,
+                    sub:"Schmidt-Appleman criterion satisfied",trend:88 },
+                ].map((card,i) => (
+                  <div key={i} style={{ padding:"20px",background:"#070b14" }}>
+                    <StatCard {...card} delay={i*120}/>
+                  </div>
+                ))}
+              </div>
+
+              {/* AI RECOMMENDATION */}
+              <div style={{ padding:"24px 28px",background:"#070b14",flex:1 }}>
+                <div style={{ marginBottom:16 }}>
+                  <span style={{ fontSize:"0.5rem",letterSpacing:"0.2em",color:"#2a5070",textTransform:"uppercase" }}>◈ AI RECOMMENDATION ENGINE</span>
+                </div>
+                <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:24 }}>
+                  <div style={{ padding:20,background:"rgba(255,255,255,0.02)",border:"1px solid rgba(0,245,255,0.08)" }}>
+                    <div style={{ fontSize:"0.6rem",letterSpacing:"0.15em",color:"#2a5070",textTransform:"uppercase",marginBottom:2 }}>Flight Level Analysis</div>
+                    <FlightLevelComparison current={380} optimized={360}/>
+                  </div>
+                  <div style={{ padding:20,background:"rgba(255,255,255,0.02)",border:"1px solid rgba(0,245,255,0.08)",display:"flex",flexDirection:"column" }}>
+                    <div style={{ fontSize:"0.6rem",letterSpacing:"0.15em",color:"#2a5070",textTransform:"uppercase",marginBottom:12 }}>Climate Impact Score</div>
+                    <div style={{ display:"flex",justifyContent:"space-around",flex:1,alignItems:"center" }}>
+                      <RadialGauge value={23} max={100} label="CURRENT" color="#ff6b35"/>
+                      <div style={{ textAlign:"center" }}>
+                        <div style={{ fontSize:"0.55rem",color:"#2a5070",marginBottom:4 }}>AI DELTA</div>
+                        <div className="neon-text-cyan" style={{ fontFamily:"'Orbitron',sans-serif",fontSize:"1.4rem",fontWeight:700 }}>+65</div>
+                        <div style={{ fontSize:"0.55rem",color:"#39ff14",marginTop:2 }}>pts</div>
+                      </div>
+                      <RadialGauge value={88} max={100} label="OPTIMIZED" color="#00f5ff"/>
+                    </div>
+                    <div style={{ marginTop:12,padding:"8px 12px",background:"rgba(57,255,20,0.05)",border:"1px solid rgba(57,255,20,0.15)",fontSize:"0.6rem",color:"#39ff14",letterSpacing:"0.05em" }}>
+                      ✓ Net CO₂e reduction exceeds contrail warming penalty
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* RIGHT SIDEBAR */}
+            <div style={{ background:"#060914",display:"flex",flexDirection:"column",gap:1 }}>
+
+              {/* ALGORITHM PANEL */}
+              <div style={{ padding:"20px",borderBottom:"1px solid rgba(0,245,255,0.06)" }}>
+                <div style={{ fontSize:"0.5rem",letterSpacing:"0.2em",color:"#2a5070",textTransform:"uppercase",marginBottom:12 }}>◈ ALGORITHM CORE</div>
+                <div style={{ fontFamily:"'Orbitron',sans-serif",fontSize:"0.7rem",fontWeight:600,color:"#00f5ff",marginBottom:4,letterSpacing:"0.05em" }}>Schmidt-Appleman Criterion</div>
+                <div style={{ fontSize:"0.62rem",color:"#4a7fa5",lineHeight:1.6,marginBottom:14 }}>Evaluates whether aircraft exhaust will form persistent contrails based on ambient temperature, humidity, and engine thermodynamics.</div>
+                <div style={{ background:"rgba(0,245,255,0.03)",border:"1px solid rgba(0,245,255,0.1)",padding:"10px 14px",fontFamily:"'Share Tech Mono',monospace",fontSize:"0.6rem",color:"#6aabcf",lineHeight:2,marginBottom:14 }}>
+                  <div style={{ color:"#2a5070",marginBottom:4 }}>// SAC threshold condition:</div>
+                  <div>G = <span style={{ color:"#00f5ff" }}>EI_H₂O</span> × Cp × P</div>
+                  <div>    / (<span style={{ color:"#ff6b35" }}>ε × Q × (1 - η)</span>)</div>
+                  <div style={{ marginTop:6,color:"#2a5070" }}>// PINN residual loss:</div>
+                  <div>L = L_data + <span style={{ color:"#39ff14" }}>λ × L_physics</span></div>
+                </div>
+                <div style={{ fontFamily:"'Orbitron',sans-serif",fontSize:"0.7rem",fontWeight:600,color:"#00f5ff",marginBottom:4,letterSpacing:"0.05em" }}>Physics-Informed NN</div>
+                <div style={{ fontSize:"0.62rem",color:"#4a7fa5",lineHeight:1.6,marginBottom:14 }}>PINN embeds SAC physics directly into the loss function, ensuring atmospheric consistency even in sparse data regions.</div>
+                {[{label:"Model Accuracy",val:"94.2%",color:"#39ff14"},{label:"Prediction Horizon",val:"6 hrs",color:"#00f5ff"},{label:"Grid Resolution",val:"0.25°",color:"#00f5ff"},{label:"Inference Time",val:"<80ms",color:"#00f5ff"}].map(item => (
+                  <div key={item.label} style={{ display:"flex",justifyContent:"space-between",padding:"7px 0",borderBottom:"1px solid rgba(0,245,255,0.04)" }}>
+                    <span style={{ fontSize:"0.6rem",color:"#2a5070" }}>{item.label}</span>
+                    <span style={{ fontFamily:"'Orbitron',sans-serif",fontSize:"0.65rem",fontWeight:600,color:item.color }}>{item.val}</span>
+                  </div>
+                ))}
+              </div>
+
+              {/* ATMOSPHERIC TELEMETRY */}
+              <div style={{ padding:"20px",borderBottom:"1px solid rgba(0,245,255,0.06)" }}>
+                <div style={{ fontSize:"0.5rem",letterSpacing:"0.2em",color:"#2a5070",textTransform:"uppercase",marginBottom:12 }}>◈ ATMOSPHERIC TELEMETRY</div>
+                {[{param:"Ambient Temp (FL380)",val:"-58°C",warn:true},{param:"Relative Humidity (ice)",val:"118%",warn:true},{param:"Wind (200hPa)",val:"J/S 280°/95kt"},{param:"Tropopause Height",val:"FL420"},{param:"OAT deviation",val:"-4°C ISA-"},{param:"ECMWF Model Run",val:"00Z+12h"}].map(item => (
+                  <div key={item.param} style={{ display:"flex",justifyContent:"space-between",alignItems:"center",padding:"6px 0",borderBottom:"1px solid rgba(0,245,255,0.03)" }}>
+                    <span style={{ fontSize:"0.58rem",color:"#2a5070" }}>{item.param}</span>
+                    <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.6rem",color:item.warn?"#ff6b35":"#4a7fa5",...(item.warn?{textShadow:"0 0 8px rgba(255,107,53,0.5)"}:{}) }}>{item.val}</span>
+                  </div>
+                ))}
+              </div>
+
+              {/* DATA SOURCES */}
+              <div style={{ padding:"20px",borderBottom:"1px solid rgba(0,245,255,0.06)" }}>
+                <div style={{ fontSize:"0.5rem",letterSpacing:"0.2em",color:"#2a5070",textTransform:"uppercase",marginBottom:12 }}>◈ DATA SOURCES</div>
+                {[{name:"ECMWF ERA5",status:"LIVE",type:"Weather Model"},{name:"OpenSky ADS-B",status:"LIVE",type:"Flight Tracking"},{name:"GOES-16 IR",status:"LIVE",type:"Satellite"},{name:"PyContrails",status:"ACTIVE",type:"Physics Engine"}].map(item => (
+                  <div key={item.name} style={{ display:"flex",alignItems:"center",gap:10,padding:"7px 0",borderBottom:"1px solid rgba(0,245,255,0.03)" }}>
+                    <div className="blink" style={{ width:6,height:6,borderRadius:"50%",background:"#39ff14",flexShrink:0,boxShadow:"0 0 6px #39ff14" }}/>
+                    <div style={{ flex:1 }}>
+                      <div style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.62rem",color:"#6aabcf" }}>{item.name}</div>
+                      <div style={{ fontSize:"0.52rem",color:"#2a5070" }}>{item.type}</div>
+                    </div>
+                    <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.5rem",letterSpacing:"0.08em",background:"rgba(57,255,20,0.08)",border:"1px solid rgba(57,255,20,0.2)",color:"#39ff14",padding:"1px 6px" }}>{item.status}</span>
+                  </div>
+                ))}
+              </div>
+
+              {/* PILOT ACTION */}
+              <div style={{ padding:"20px",marginTop:"auto" }}>
+                <div style={{ fontSize:"0.5rem",letterSpacing:"0.2em",color:"#2a5070",textTransform:"uppercase",marginBottom:12 }}>◈ CLEARANCE REQUEST</div>
+                <div style={{ padding:"12px 16px",background:"rgba(255,107,53,0.05)",border:"1px solid rgba(255,107,53,0.2)",marginBottom:10,fontSize:"0.62rem",color:"#ff8c5a",lineHeight:1.6 }}>
+                  ⚠ ISSR-α detected ahead.<br/>Recommend descent to FL360 in 18 min.
+                </div>
+                <button onClick={() => setShowOptRoute(true)} style={{ width:"100%",fontFamily:"'Orbitron',sans-serif",fontSize:"0.65rem",fontWeight:700,letterSpacing:"0.1em",textTransform:"uppercase",background:"linear-gradient(135deg,rgba(0,245,255,0.12),rgba(0,245,255,0.06))",border:"1px solid rgba(0,245,255,0.4)",color:"#00f5ff",padding:"12px",cursor:"pointer",boxShadow:"0 0 20px rgba(0,245,255,0.1)",transition:"all 0.2s" }}>
+                  ✈ Accept AI Route
+                </button>
+                <button style={{ width:"100%",fontFamily:"'Share Tech Mono',monospace",fontSize:"0.6rem",letterSpacing:"0.1em",textTransform:"uppercase",background:"transparent",border:"1px solid rgba(255,255,255,0.08)",color:"#2a5070",padding:"10px",cursor:"pointer",marginTop:6,transition:"all 0.2s" }}>
+                  ○ Maintain Current FL
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<AeroMist/>);
+  </script>
+</body>
+</html>
